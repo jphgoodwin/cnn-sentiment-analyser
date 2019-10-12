@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as fn
 import pdb
 import data_loader
+import os
 
 class SkipGram(nn.Module):
     # Class constructor.
@@ -14,18 +15,32 @@ class SkipGram(nn.Module):
         self.vocab_size = v_size
         self.hidden_size = d_size
 
+        # Embedding layer that will contain the vector represenetations of the vocabulary.
         self.embeddings = nn.Embedding(v_size, d_size)
+
+        # Linear layer that will transform embedding vectors back into one-hot-encoded vectors
+        # with length equal to the size of the vocabulary.
         self.linear = nn.Linear(d_size, v_size)
+
+        # LogSoftmax layer used in training to feed into the NLLLoss function.
         self.logsoftmax = nn.LogSoftmax(dim=1)
+
+        # Softmax layer used during validation and testing to allow retrieval of word predictions.
         self.softmax = nn.Softmax(dim=1)
+
+        # Negative Log Loss function used for backpropagation.
         self.loss = nn.NLLLoss()
 
+    # Feedforward function returns embedding vectors from embedding matrix for one or more word indices.
     def forward(self, x):
-        # Pass input through layers sequentially.
-        out1 = self.embeddings(x)
-        out2 = self.linear(out1)
-        return out2
+        # Pass input through embedding layer to retrieve word vector(s).
+        out = self.embeddings(x)
+        return out
 
+# Function trains embedding parameters using training_data provided, in batches of size bs, and
+# for the specified number of epochs. The learning rate must also be specified, and you can
+# optionally set the context window size (default 1), and whether or not to use padding. If
+# validation_data is provided then this will be used to track training progress.
 def train(model, training_data, epochs, bs, lr, context=1, padding=True, validation_data=None):
     # Add padding equal to size of context window if required.
     if padding:
@@ -75,11 +90,12 @@ def train(model, training_data, epochs, bs, lr, context=1, padding=True, validat
             x_indxs = torch.tensor(x_indxs)
             y_indxs = torch.tensor(y_indxs, dtype=torch.long)
 
-            # Do a forward pass of x_indxs through the network to generate y_preds values.
-            y_preds = model.logsoftmax(model(x_indxs))
-
-            # Zero gradients before running the backward pass.
+            # Zero gradients before running batch through model.
             model.zero_grad()
+
+            # Do a forward pass of x_indxs through embedding, linear, and logsoftmax layers
+            # to generate y_preds values.
+            y_preds = model.logsoftmax(model.linear(model(x_indxs)))
 
             # Calculate the negative log loss between y_preds and y_indxs.
             loss = model.loss(y_preds, y_indxs)
@@ -103,55 +119,155 @@ def train(model, training_data, epochs, bs, lr, context=1, padding=True, validat
                     examples.append((validation_data[wn], validation_data[wn-cw]))
                     examples.append((validation_data[wn], validation_data[wn+cw]))
 
-            test_results = []
-            # Iterate over validation data.
-            for x, y in examples:
-                # Set x_indx to input word index.
-                x_indx = torch.tensor([x], dtype=torch.long)
+            # Run through model without calculating gradients, as we don't need them at this stage.
+            with torch.no_grad():
+                test_results = []
+                # Iterate over validation data.
+                for x, y in examples:
+                    # Set x_indx to input word index.
+                    x_indx = torch.tensor([x], dtype=torch.long)
 
-                # Create output one-hot-encoded word vector from output word index.
-                y_vec = torch.zeros(model.vocab_size, dtype=torch.long)
-                y_vec[y] = 1
+                    # Create output one-hot-encoded word vector from output word index.
+                    y_vec = torch.zeros(model.vocab_size, dtype=torch.long)
+                    y_vec[y] = 1
 
-                # Add tuple of predicted and actual output vectors to test_results.
-                test_results.append((model.softmax(model(x_indx)), y_vec))
+                    # Add tuple of predicted and actual output vectors to test_results.
+                    test_results.append((model.softmax(model.linear(model(x_indx))).flatten(), y_vec))
 
-            num_correct = 0
-            # Iterate over test_results and compare predicted to actual output, counting the
-            # number of predicted vectors that contain the actual vector for each example.
-            for y_pred, y_act in test_results:
-                # Round all values greater than or equal to 0.1 to 1 and the rest to 0.
-                y_pred.gt_(0.1).type(torch.LongTensor)
+                # print(test_results[0])
+                num_correct = 0
+                # Iterate over test_results and compare predicted to actual output, counting the
+                # number of predicted vectors that contain the actual vector for each example.
+                for y_pred, y_act in test_results:
+                    # Round all values greater than or equal to 0.1 to 1 and the rest to 0.
+                    y_pred.gt_(0.1).type(torch.LongTensor)
 
-                # Extract indices.
-                p_indxs = torch.nonzero(y_pred)
-                a_indx = torch.nonzero(y_act)
+                    # Extract indices.
+                    p_indxs = torch.nonzero(y_pred)
+                    a_indx = torch.nonzero(y_act)
 
-                # Determine whether y_act is included in y_pred and increment num_correct if so.
-                if ((p_indxs == a_indx).nonzero().nelement() > 0):
-                    num_correct += 1
+                    # Determine whether y_act is included in y_pred and increment num_correct if so.
+                    if ((p_indxs == a_indx).nonzero().nelement() > 0):
+                        num_correct += 1
 
-            # Print results.
-            print("Epoch {0}: {1} / {2}".format(i, num_correct, len(test_results)))
+                # Print results.
+                print("Epoch {0}: {1} / {2}".format(i, num_correct, len(test_results)))
+
+# Function tests model on provided dataset and prints comparison of predicted words against
+# actual words in string format if vocabulary provided, otherwise as indices.
+def test(model, test_data, context=1, padding=True, vocab=None):
+    # Add padding equal to size of context window if required.
+    if padding:
+        for p in range(0, context):
+            # Add padding to beginning. Padding is represented by "##" in index 1 of vocabulary.
+            test_data.insert(0, 1)
+            # Add padding to end.
+            test_data.append(1)
+
+    # Create example tuples for each word paired with the words in its context window, and
+    # concatenate into a single examples list.
+    examples = []
+    for wn in range(context, len(test_data) - context):
+        for cw in range(1, context+1):
+            examples.append((test_data[wn], test_data[wn-cw]))
+            examples.append((test_data[wn], test_data[wn+cw]))
+
+    # Run through model without calculating gradients as we don't need them when testing.
+    with torch.no_grad():
+        test_results = []
+        # Iterate over test data.
+        for x, y in examples:
+            # Set x_index to input word index.
+            x_indx = torch.tensor([x], dtype=torch.long)
+
+            # Create output one-hot-encoded word vector from output word index.
+            y_vec = torch.zeros(model.vocab_size, dtype=torch.long)
+            y_vec[y] = 1
+
+            # Add tuple of predicted and actual output vectors to test_results.
+            test_results.append((x_indx, model.softmax(model.linear(model(x_indx))).flatten(), y_vec))
+
+        num_correct = 0
+        # Iterate over test_results and compare predicted to actual output, counting the
+        # number that match.
+        for x_indx, y_pred, y_act in test_results:
+            # Round all values greater than or equal to 0.1 to 1 and the rest to 0.
+            y_pred.gt_(0.1).type(torch.LongTensor)
+            
+            # Extract word indices from word vectors and lookup in vocabulary if available.
+            # Extract indices.
+            p_indxs = torch.nonzero(y_pred)
+            a_indx = torch.nonzero(y_act)
+
+            if vocab:
+                # Map to word strings.
+                x_word = vocab[x_indx]
+                p_words = [vocab[w] for w in p_indxs]
+                a_words = [vocab[w] for w in a_indx]
+
+                # Print words.
+                print("x: {0}, y_pred: {1}, y_act: {2}".format(x_word, p_words, a_words))
+            else:
+                # Print indices.
+                print("x: {0}".format(x_indx))
+                print("y_pred:")
+                print(p_indxs)
+                print("y_act:")
+                print(a_indx)
+
+            # Determine whether y_act is included in y_pred and increment num_correct if so.
+            if ((p_indxs == a_indx).nonzero().nelement() > 0):
+                print("correct")
+                num_correct += 1
+
+        # Print results.
+        print("Test results: {0} / {1}".format(num_correct, len(test_results)))
+
+def saveModel(model, model_name):
+    try:
+        # See if model_name directory already exists.
+        os.listdir("./models/" + model_name)
+    except FileNotFoundError:
+        # If not, make it.
+        os.makedirs("./models/" + model_name)
+
+    # Save the model parameters to a file within the model_name directory.
+    torch.save(model.state_dict(), "./models/" + model_name + "/state_dict.pt")
 
 
-dl = data_loader.IMDBDataLoader("./data/aclImdb/imdb.vocab", "./data/aclImdb/train/", "./data/aclImdb/test/", 3, 3)
+def loadModel(model, model_name):
+    try:
+        # Load the saved model parameters into our model instance.
+        model.load_state_dict(torch.load("./models/" + model_name + "/state_dict.pt"))
+    except FileNotFoundError:
+        # Alert user if files don't exist.
+        print("Saved file not found.")
+
+# Load IMDB dataset.
+dl = data_loader.IMDBDataLoader("./data/aclImdb/imdb.vocab", "./data/aclImdb/train/", "./data/aclImdb/test/", 1, 1)
 
 # Extract training data as list of words, concatenating examples together.
 tr_data = []
 for ex in dl.ptrainex:
     tr_data.extend(ex[2])
+
+# Reuse training examples for validation.
 va_data = tr_data[:]
+
+# Extract test data similarly to training data.
 te_data = []
 for ex in dl.ptestex:
     te_data.extend(ex[2])
 
+# Create SkipGram model instance.
 sg = SkipGram(len(dl.vocab), 10)
 
-train(model=sg, training_data=tr_data, epochs=50, bs=16, lr=0.005, context=1, validation_data=va_data)
+loadModel(sg, "model_1")
 
-# x_in = torch.tensor(0)
-# x_out = sg(x_in)
+# Train model with training dataset.
+train(model=sg, training_data=tr_data, epochs=50, bs=16, lr=0.1, context=1, validation_data=va_data)
 
-# print(sg.embeddings.weight)
-# print(x_out)
+# saveModel(sg, "model_1")
+
+# Test model with test dataset.
+test(model=sg, test_data=tr_data, context=1, vocab=dl.vocab)
