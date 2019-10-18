@@ -73,56 +73,48 @@ def train(model, training_data, epochs, bs, lr, context=1, padding=True, validat
             examples.append((training_data[wn], training_data[wn-cw]))
             examples.append((training_data[wn], training_data[wn+cw]))
 
-    # Break the examples down into subsets so they can be loaded to and from
-    # GPU memory in manageable numbers.
-    ex_subsets = [examples[k:k+5000] for k in range(0, len(examples), 5000)]
-
+    # Break the examples down into batches of size bs.
+    batches = [examples[en:en+bs] for en in range(0, len(examples), bs)]
 
     # Create an optimizer.
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
     # Train for the specified number of epochs.
     for i in range(1, epochs+1):
-        # Iterate over example subsets.
-        for subset in ex_subsets:
-            # Break the examples down into batches of size bs.
-            batches = [subset[en:en+bs] for en in range(0, len(subset), bs)]
+        # Iterate over the batches.
+        for batch in batches:
+            # Create lists of input and target output word indexes.
+            x_indxs = []
+            y_indxs = []
+            for x, y in batch:
+                # Add input index to list.
+                x_indxs.append(x)
+                # Add output index to list.
+                y_indxs.append(y)
 
-            # Iterate over the batches.
-            for batch in batches:
-                # Create lists of input and target output word indexes.
-                x_indxs = []
-                y_indxs = []
-                for x, y in batch:
-                    # Add input index to list.
-                    x_indxs.append(x)
-                    # Add output index to list.
-                    y_indxs.append(y)
+            # Convert index lists to tensor.
+            x_indxs = torch.tensor(x_indxs, device=device)
+            y_indxs = torch.tensor(y_indxs, dtype=torch.long, device=device)
+            
+            # Zero gradients before running batch through model.
+            optimizer.zero_grad()
 
-                # Convert index lists to tensor.
-                x_indxs = torch.tensor(x_indxs).to(device)
-                y_indxs = torch.tensor(y_indxs, dtype=torch.long).to(device)
+            # Do a forward pass of x_indxs through embedding, linear, and logsoftmax layers
+            # to generate y_preds values.
+            y_preds = model.logsoftmax(model.linear(model(x_indxs)))
 
-                # Zero gradients before running batch through model.
-                # model.zero_grad()
-                optimizer.zero_grad()
+            # Calculate the negative log loss between y_preds and y_indxs.
+            loss = model.loss(y_preds, y_indxs)
 
-                # Do a forward pass of x_indxs through embedding, linear, and logsoftmax layers
-                # to generate y_preds values.
-                y_preds = model.logsoftmax(model.linear(model(x_indxs)))
+            # Do a backward pass using autograd to calculate gradient of loss with respect to
+            # model parameters.
+            loss.backward()
 
-                # Calculate the negative log loss between y_preds and y_indxs.
-                loss = model.loss(y_preds, y_indxs)
+            # Update model parameters using calculated gradients.
+            optimizer.step()
 
-                # Do a backward pass using autograd to calculate gradient of loss with respect to
-                # model parameters.
-                loss.backward()
-
-                # Update model parameters using calculated gradients.
-                # with torch.no_grad():
-                #     for param in model.parameters():
-                #         param -= lr * param.grad
-                optimizer.step()
+        # Empty GPU memory cache.
+        torch.cuda.empty_cache()
 
         # If there is validation data, use it to test the performance of the network.
         if validation_data:
@@ -134,43 +126,50 @@ def train(model, training_data, epochs, bs, lr, context=1, padding=True, validat
                     examples.append((validation_data[wn], validation_data[wn-cw]))
                     examples.append((validation_data[wn], validation_data[wn+cw]))
 
+            # Break the examples down into batches of size bs.
+            batches = [examples[en:en+bs] for en in range(0, len(examples), bs)]
+
             # Run through model without calculating gradients, as we don't need them at this stage.
             with torch.no_grad():
-                test_results = []
-                # Iterate over validation data.
-                for x, y in examples:
-                    # Set x_indx to input word index.
-                    x_indx = torch.tensor([x], dtype=torch.long).to(device)
-
-                    # Create output one-hot-encoded word vector from output word index.
-                    y_vec = torch.zeros(model.vocab_size, dtype=torch.long)
-                    y_vec[y] = 1
-
-                    # Add tuple of predicted and actual output vectors to test_results.
-                    test_results.append((model.softmax(model.linear(model(x_indx))).flatten(), y_vec))
-
-                # print(test_results[0])
                 num_correct = 0
-                # Iterate over test_results and compare predicted to actual output, counting the
-                # number of predicted vectors that contain the actual vector for each example.
-                for y_pred, y_act in test_results:
-                    # Round all values greater than or equal to 0.1 to 1 and the rest to 0.
-                    y_pred.gt_(0.1).type(torch.LongTensor)
+                # Iterate over batches.
+                for batch in batches:
+                    # Create lists of input and target output word indices.
+                    x_indxs = []
+                    y_indxs = []
+                    for x, y in batch:
+                        # Add input index to list.
+                        x_indxs.append(x)
+                        # Add output index to list.
+                        y_indxs.append(y)
 
-                    # Extract indices.
-                    p_indxs = torch.nonzero(y_pred).to(device)
-                    a_indx = torch.nonzero(y_act).to(device)
+                    # Convert input index list to tensor.
+                    x_indxs = torch.tensor(x_indxs, device=device)
 
-                    # Determine whether y_act is included in y_pred and increment num_correct if so.
-                    if ((p_indxs == a_indx).nonzero().nelement() > 0):
-                        num_correct += 1
+                    # Do a foward pass through embedding, linear and softmax layers to generate y_preds.
+                    # Round all values greater than 0.1 to 1 and the rest to 0.
+                    y_preds = model.softmax(model.linear(model(x_indxs))).gt(0.1).type(torch.long)
+
+                    # Iterate over examples in batch and count matches between predicted and actual words.
+                    for n in range(0, len(batch)):
+                        # Extract predicted and actual word indices.
+                        p_indxs = torch.nonzero(y_preds[n])
+                        a_indx = y_indxs[n]
+
+                        # Determine whether a_indx is included in p_indxs and increment num_correct if so.
+                        if ((p_indxs == a_indx).nonzero().nelement() > 0):
+                            num_correct += 1
+
+                # Clear GPU cache.
+                torch.cuda.empty_cache()
 
                 # Print results.
-                print("Epoch {0}: {1} / {2}".format(i, num_correct, len(test_results)))
+                print("Epoch {0}: {1} / {2}".format(i, num_correct, len(examples)))
+
 
 # Function tests model on provided dataset and prints comparison of predicted words against
 # actual words in string format if vocabulary provided, otherwise as indices.
-def test(model, test_data, context=1, padding=True, vocab=None):
+def test(model, test_data, bs, context=1, padding=True, vocab=None, printWords=False):
     # Add padding equal to size of context window if required.
     if padding:
         for p in range(0, context):
@@ -187,56 +186,58 @@ def test(model, test_data, context=1, padding=True, vocab=None):
             examples.append((test_data[wn], test_data[wn-cw]))
             examples.append((test_data[wn], test_data[wn+cw]))
 
+    # Break the examples down into batches of size bs.
+    batches = [examples[en:en+bs] for en in range(0, len(examples), bs)]
+
     # Run through model without calculating gradients as we don't need them when testing.
     with torch.no_grad():
-        test_results = []
-        # Iterate over test data.
-        for x, y in examples:
-            # Set x_index to input word index.
-            x_indx = torch.tensor([x], dtype=torch.long).to(device)
-
-            # Create output one-hot-encoded word vector from output word index.
-            y_vec = torch.zeros(model.vocab_size, dtype=torch.long)
-            y_vec[y] = 1
-
-            # Add tuple of predicted and actual output vectors to test_results.
-            test_results.append((x_indx, model.softmax(model.linear(model(x_indx))).flatten(), y_vec))
-
         num_correct = 0
-        # Iterate over test_results and compare predicted to actual output, counting the
-        # number that match.
-        for x_indx, y_pred, y_act in test_results:
-            # Round all values greater than or equal to 0.1 to 1 and the rest to 0.
-            y_pred.gt_(0.1).type(torch.LongTensor)
-            
-            # Extract word indices from word vectors and lookup in vocabulary if available.
-            # Extract indices.
-            p_indxs = torch.nonzero(y_pred).to(device)
-            a_indx = torch.nonzero(y_act).to(device)
+        # Iterate over batches.
+        for batch in batches:
+            # Create lists of input and target output word indices.
+            x_indxs = []
+            y_indxs = []
+            for x, y in batch:
+                # Add input index to list.
+                x_indxs.append(x)
+                # Add output index to list.
+                y_indxs.append(y)
 
-            if vocab:
-                # Map to word strings.
-                x_word = vocab[x_indx]
-                p_words = [vocab[w] for w in p_indxs]
-                a_words = [vocab[w] for w in a_indx]
+            # Convert input index list to tensor.
+            x_indxs = torch.tensor(x_indxs, device=device)
 
-                # Print words.
-                print("x: {0}, y_pred: {1}, y_act: {2}".format(x_word, p_words, a_words))
-            else:
-                # Print indices.
-                print("x: {0}".format(x_indx))
-                print("y_pred:")
-                print(p_indxs)
-                print("y_act:")
-                print(a_indx)
+            # Do a forward pass through embedding, linear and softmax layers to generate y_preds.
+            # Round all values greater that 0.1 to 1 and the rest to 0.
+            y_preds = model.softmax(model.linear(model(x_indxs))).gt(0.1).type(torch.long)
 
-            # Determine whether y_act is included in y_pred and increment num_correct if so.
-            if ((p_indxs == a_indx).nonzero().nelement() > 0):
-                print("correct")
-                num_correct += 1
+            # Iterate over examples in batch and count matches between prediced and actual words.
+            for n in range(0, len(batch)):
+                # Extract predicted and actual word indices.
+                p_indxs = torch.nonzero(y_preds[n])
+                a_indx = y_indxs[n]
+
+                # Determine whether a_indx is included in p_indxs and increment num_correct if so.
+                if ((p_indxs == a_indx).nonzero().nelement() > 0):
+                    num_correct += 1
+
+                if printWords and vocab:
+                    # Map to word strings.
+                    x_word = vocab[x_indxs[n]]
+                    p_words = [vocab[w] for w in p_indxs]
+                    a_word = vocab[a_indx]
+
+                    # Print words
+                    print("x: {0}, y_pred: {1}, y_act: {2}".format(x_word, p_words, a_word))
+                elif printWords:
+                    # Print indices.
+                    print("x: {0}, y_pred: {1}, y_act: {2}".format(x_indx, p_indxs, a_indx))
+
+        # Clear GPU cache.
+        torch.cuda.empty_cache()
 
         # Print results.
-        print("Test results: {0} / {1}".format(num_correct, len(test_results)))
+        print("Test results: {0} / {1}".format(num_correct, len(examples)))
+
 
 def saveModel(model, model_name):
     try:
@@ -259,14 +260,12 @@ def loadModel(model, model_name):
         print("Saved file not found.")
 
 # Load IMDB dataset.
-dl = data_loader.IMDBDataLoader("./data/aclImdb/imdb.vocab", "./data/aclImdb/train/", "./data/aclImdb/test/", 100, 10)
-
-tr_batches = [dl.ptrainex[k:k+10] for k in range(0, len(dl.ptrainex), 10)]
+dl = data_loader.IMDBDataLoader("./data/aclImdb/imdb.vocab", "./data/aclImdb/train/", "./data/aclImdb/test/", 10, 10)
 
 # Create SkipGram model instance.
 sg = SkipGram(len(dl.vocab), 10)
 
-loadModel(sg, "gcp_model_2")
+loadModel(sg, "model_2")
 
 # Move model onto GPU if available.
 sg = sg.to(device)
@@ -277,12 +276,12 @@ for ex in dl.ptrainex:
     tr_data.extend(ex[2])
 
 # Reuse training examples for validation.
-va_data = tr_data[:1000]
+va_data = tr_data[:10000]
 
 # Train model with training dataset.
-train(model=sg, training_data=tr_data, epochs=50, bs=16, lr=0.01, context=2, validation_data=va_data)
+train(model=sg, training_data=tr_data, epochs=5, bs=2048, lr=0.01, context=2, validation_data=va_data)
 
-saveModel(sg, "gcp_model_3")
+# saveModel(sg, "gcp_model_5")
 
 # Extract test data similarly to training data.
 te_data = []
@@ -290,4 +289,4 @@ for ex in dl.ptestex:
     te_data.extend(ex[2])
 
 # Test model with test dataset.
-test(model=sg, test_data=te_data, context=2, vocab=dl.vocab)
+test(model=sg, test_data=te_data, bs=2048, context=2, vocab=dl.vocab, printWords=False)
