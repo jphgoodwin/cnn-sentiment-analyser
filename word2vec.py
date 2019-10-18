@@ -5,6 +5,10 @@ import pdb
 import data_loader
 import os
 
+# Use gpu if available, otherwise use cpu.
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+print(device)
+
 class SkipGram(nn.Module):
     # Class constructor.
     def __init__(self, v_size, d_size):
@@ -69,45 +73,56 @@ def train(model, training_data, epochs, bs, lr, context=1, padding=True, validat
             examples.append((training_data[wn], training_data[wn-cw]))
             examples.append((training_data[wn], training_data[wn+cw]))
 
-    # Break the examples down into batches of size bs.
-    batches = [examples[en:en+bs] for en in range(0, len(examples), bs)]
+    # Break the examples down into subsets so they can be loaded to and from
+    # GPU memory in manageable numbers.
+    ex_subsets = [examples[k:k+5000] for k in range(0, len(examples), 5000)]
+
+
+    # Create an optimizer.
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
     # Train for the specified number of epochs.
     for i in range(1, epochs+1):
+        # Iterate over example subsets.
+        for subset in ex_subsets:
+            # Break the examples down into batches of size bs.
+            batches = [subset[en:en+bs] for en in range(0, len(subset), bs)]
 
-        # Iterate over the batches.
-        for batch in batches:
-            # Create lists of input and target output word indexes.
-            x_indxs = []
-            y_indxs = []
-            for x, y in batch:
-                # Add input index to list.
-                x_indxs.append(x)
-                # Add output index to list.
-                y_indxs.append(y)
+            # Iterate over the batches.
+            for batch in batches:
+                # Create lists of input and target output word indexes.
+                x_indxs = []
+                y_indxs = []
+                for x, y in batch:
+                    # Add input index to list.
+                    x_indxs.append(x)
+                    # Add output index to list.
+                    y_indxs.append(y)
 
-            # Convert index lists to tensor.
-            x_indxs = torch.tensor(x_indxs)
-            y_indxs = torch.tensor(y_indxs, dtype=torch.long)
+                # Convert index lists to tensor.
+                x_indxs = torch.tensor(x_indxs).to(device)
+                y_indxs = torch.tensor(y_indxs, dtype=torch.long).to(device)
 
-            # Zero gradients before running batch through model.
-            model.zero_grad()
+                # Zero gradients before running batch through model.
+                # model.zero_grad()
+                optimizer.zero_grad()
 
-            # Do a forward pass of x_indxs through embedding, linear, and logsoftmax layers
-            # to generate y_preds values.
-            y_preds = model.logsoftmax(model.linear(model(x_indxs)))
+                # Do a forward pass of x_indxs through embedding, linear, and logsoftmax layers
+                # to generate y_preds values.
+                y_preds = model.logsoftmax(model.linear(model(x_indxs)))
 
-            # Calculate the negative log loss between y_preds and y_indxs.
-            loss = model.loss(y_preds, y_indxs)
+                # Calculate the negative log loss between y_preds and y_indxs.
+                loss = model.loss(y_preds, y_indxs)
 
-            # Do a backward pass using autograd to calculate gradient of loss with respect to
-            # model parameters.
-            loss.backward()
+                # Do a backward pass using autograd to calculate gradient of loss with respect to
+                # model parameters.
+                loss.backward()
 
-            # Update model parameters using calculated gradients.
-            with torch.no_grad():
-                for param in model.parameters():
-                    param -= lr * param.grad
+                # Update model parameters using calculated gradients.
+                # with torch.no_grad():
+                #     for param in model.parameters():
+                #         param -= lr * param.grad
+                optimizer.step()
 
         # If there is validation data, use it to test the performance of the network.
         if validation_data:
@@ -125,7 +140,7 @@ def train(model, training_data, epochs, bs, lr, context=1, padding=True, validat
                 # Iterate over validation data.
                 for x, y in examples:
                     # Set x_indx to input word index.
-                    x_indx = torch.tensor([x], dtype=torch.long)
+                    x_indx = torch.tensor([x], dtype=torch.long).to(device)
 
                     # Create output one-hot-encoded word vector from output word index.
                     y_vec = torch.zeros(model.vocab_size, dtype=torch.long)
@@ -143,8 +158,8 @@ def train(model, training_data, epochs, bs, lr, context=1, padding=True, validat
                     y_pred.gt_(0.1).type(torch.LongTensor)
 
                     # Extract indices.
-                    p_indxs = torch.nonzero(y_pred)
-                    a_indx = torch.nonzero(y_act)
+                    p_indxs = torch.nonzero(y_pred).to(device)
+                    a_indx = torch.nonzero(y_act).to(device)
 
                     # Determine whether y_act is included in y_pred and increment num_correct if so.
                     if ((p_indxs == a_indx).nonzero().nelement() > 0):
@@ -178,7 +193,7 @@ def test(model, test_data, context=1, padding=True, vocab=None):
         # Iterate over test data.
         for x, y in examples:
             # Set x_index to input word index.
-            x_indx = torch.tensor([x], dtype=torch.long)
+            x_indx = torch.tensor([x], dtype=torch.long).to(device)
 
             # Create output one-hot-encoded word vector from output word index.
             y_vec = torch.zeros(model.vocab_size, dtype=torch.long)
@@ -196,8 +211,8 @@ def test(model, test_data, context=1, padding=True, vocab=None):
             
             # Extract word indices from word vectors and lookup in vocabulary if available.
             # Extract indices.
-            p_indxs = torch.nonzero(y_pred)
-            a_indx = torch.nonzero(y_act)
+            p_indxs = torch.nonzero(y_pred).to(device)
+            a_indx = torch.nonzero(y_act).to(device)
 
             if vocab:
                 # Map to word strings.
@@ -244,7 +259,17 @@ def loadModel(model, model_name):
         print("Saved file not found.")
 
 # Load IMDB dataset.
-dl = data_loader.IMDBDataLoader("./data/aclImdb/imdb.vocab", "./data/aclImdb/train/", "./data/aclImdb/test/", 1, 1)
+dl = data_loader.IMDBDataLoader("./data/aclImdb/imdb.vocab", "./data/aclImdb/train/", "./data/aclImdb/test/", 100, 10)
+
+tr_batches = [dl.ptrainex[k:k+10] for k in range(0, len(dl.ptrainex), 10)]
+
+# Create SkipGram model instance.
+sg = SkipGram(len(dl.vocab), 10)
+
+loadModel(sg, "gcp_model_2")
+
+# Move model onto GPU if available.
+sg = sg.to(device)
 
 # Extract training data as list of words, concatenating examples together.
 tr_data = []
@@ -252,22 +277,17 @@ for ex in dl.ptrainex:
     tr_data.extend(ex[2])
 
 # Reuse training examples for validation.
-va_data = tr_data[:]
+va_data = tr_data[:1000]
+
+# Train model with training dataset.
+train(model=sg, training_data=tr_data, epochs=50, bs=16, lr=0.01, context=2, validation_data=va_data)
+
+saveModel(sg, "gcp_model_3")
 
 # Extract test data similarly to training data.
 te_data = []
 for ex in dl.ptestex:
     te_data.extend(ex[2])
 
-# Create SkipGram model instance.
-sg = SkipGram(len(dl.vocab), 10)
-
-loadModel(sg, "model_1")
-
-# Train model with training dataset.
-train(model=sg, training_data=tr_data, epochs=50, bs=16, lr=0.1, context=1, validation_data=va_data)
-
-# saveModel(sg, "model_1")
-
 # Test model with test dataset.
-test(model=sg, test_data=tr_data, context=1, vocab=dl.vocab)
+test(model=sg, test_data=te_data, context=2, vocab=dl.vocab)
